@@ -1,0 +1,607 @@
+From df0fd6149a75084be79378d307b0461612413ce5 Mon Sep 17 00:00:00 2001
+From: Joshua Cranmer <joshua.cranmer@intel.com>
+Date: Mon, 13 Mar 2023 14:14:12 -0400
+Subject: [PATCH] [Clang][SPIR-V] Emit target extension types for OpenCL types
+ on SPIR-V.
+
+Reviewed By: Anastasia
+
+Differential Revision: https://reviews.llvm.org/D141008
+
+This patch comes from LLVM 17+ and resolves issues when compiling OCL source
+to SPIR-V with clang. Without this change, on opaque pointers, OCL types are
+emitted as opaque pointers instead of target extension types. This causes
+SPIRV-LLVM-Translator to lose additional information such as access
+qualifiers, image dimensions, etc., because they are translated to
+OpTypePointer instead of an actual type (e.g. OpTypeImage) that supports
+these attributes.
+
+diff --git a/clang/include/clang-c/Index.h b/clang/include/clang-c/Index.h
+index a3e54285f89fa..a4d7b5003cc88 100644
+--- a/clang/include/clang-c/Index.h
++++ b/clang/include/clang-c/Index.h
+@@ -2787,10 +2787,15 @@ enum CXTypeKind {
+   CXType_OCLIntelSubgroupAVCImeResult = 169,
+   CXType_OCLIntelSubgroupAVCRefResult = 170,
+   CXType_OCLIntelSubgroupAVCSicResult = 171,
++  CXType_OCLIntelSubgroupAVCImeResultSingleReferenceStreamout = 172,
++  CXType_OCLIntelSubgroupAVCImeResultDualReferenceStreamout = 173,
++  CXType_OCLIntelSubgroupAVCImeSingleReferenceStreamin = 174,
++  CXType_OCLIntelSubgroupAVCImeDualReferenceStreamin = 175,
++
++  /* Old aliases for AVC OpenCL extension types. */
+   CXType_OCLIntelSubgroupAVCImeResultSingleRefStreamout = 172,
+   CXType_OCLIntelSubgroupAVCImeResultDualRefStreamout = 173,
+   CXType_OCLIntelSubgroupAVCImeSingleRefStreamin = 174,
+-
+   CXType_OCLIntelSubgroupAVCImeDualRefStreamin = 175,
+
+   CXType_ExtVector = 176,
+diff --git a/clang/include/clang/Basic/OpenCLExtensionTypes.def b/clang/include/clang/Basic/OpenCLExtensionTypes.def
+index 84ffbe936b77d..17c72d69a0206 100644
+--- a/clang/include/clang/Basic/OpenCLExtensionTypes.def
++++ b/clang/include/clang/Basic/OpenCLExtensionTypes.def
+@@ -28,10 +28,10 @@ INTEL_SUBGROUP_AVC_TYPE(mce_result_t, MceResult)
+ INTEL_SUBGROUP_AVC_TYPE(ime_result_t, ImeResult)
+ INTEL_SUBGROUP_AVC_TYPE(ref_result_t, RefResult)
+ INTEL_SUBGROUP_AVC_TYPE(sic_result_t, SicResult)
+-INTEL_SUBGROUP_AVC_TYPE(ime_result_single_reference_streamout_t, ImeResultSingleRefStreamout)
+-INTEL_SUBGROUP_AVC_TYPE(ime_result_dual_reference_streamout_t, ImeResultDualRefStreamout)
+-INTEL_SUBGROUP_AVC_TYPE(ime_single_reference_streamin_t, ImeSingleRefStreamin)
+-INTEL_SUBGROUP_AVC_TYPE(ime_dual_reference_streamin_t, ImeDualRefStreamin)
++INTEL_SUBGROUP_AVC_TYPE(ime_result_single_reference_streamout_t, ImeResultSingleReferenceStreamout)
++INTEL_SUBGROUP_AVC_TYPE(ime_result_dual_reference_streamout_t, ImeResultDualReferenceStreamout)
++INTEL_SUBGROUP_AVC_TYPE(ime_single_reference_streamin_t, ImeSingleReferenceStreamin)
++INTEL_SUBGROUP_AVC_TYPE(ime_dual_reference_streamin_t, ImeDualReferenceStreamin)
+
+ #undef INTEL_SUBGROUP_AVC_TYPE
+ #endif // INTEL_SUBGROUP_AVC_TYPE
+diff --git a/clang/lib/CodeGen/CGOpenCLRuntime.cpp b/clang/lib/CodeGen/CGOpenCLRuntime.cpp
+index ab8de7ecf50c4..1ccfa607b3b2d 100644
+--- a/clang/lib/CodeGen/CGOpenCLRuntime.cpp
++++ b/clang/lib/CodeGen/CGOpenCLRuntime.cpp
+@@ -31,8 +31,11 @@ void CGOpenCLRuntime::EmitWorkGroupLocalVarDecl(CodeGenFunction &CGF,
+ }
+
+ llvm::Type *CGOpenCLRuntime::convertOpenCLSpecificType(const Type *T) {
+-  assert(T->isOpenCLSpecificType() &&
+-         "Not an OpenCL specific type!");
++  assert(T->isOpenCLSpecificType() && "Not an OpenCL specific type!");
++
++  // Check if the target has a specific translation for this type first.
++  if (llvm::Type *TransTy = CGM.getTargetCodeGenInfo().getOpenCLType(CGM, T))
++    return TransTy;
+
+   switch (cast<BuiltinType>(T)->getKind()) {
+   default:
+@@ -75,6 +78,9 @@ llvm::PointerType *CGOpenCLRuntime::getPointerType(const Type *T,
+ }
+
+ llvm::Type *CGOpenCLRuntime::getPipeType(const PipeType *T) {
++  if (llvm::Type *PipeTy = CGM.getTargetCodeGenInfo().getOpenCLType(CGM, T))
++    return PipeTy;
++
+   if (T->isReadOnly())
+     return getPipeType(T, "opencl.pipe_ro_t", PipeROTy);
+   else
+@@ -91,12 +97,18 @@ llvm::Type *CGOpenCLRuntime::getPipeType(const PipeType *T, StringRef Name,
+   return PipeTy;
+ }
+
+-llvm::PointerType *CGOpenCLRuntime::getSamplerType(const Type *T) {
+-  if (!SamplerTy)
+-    SamplerTy = llvm::PointerType::get(llvm::StructType::create(
+-      CGM.getLLVMContext(), "opencl.sampler_t"),
+-      CGM.getContext().getTargetAddressSpace(
+-          CGM.getContext().getOpenCLTypeAddrSpace(T)));
++llvm::Type *CGOpenCLRuntime::getSamplerType(const Type *T) {
++  if (SamplerTy)
++    return SamplerTy;
++
++  if (llvm::Type *TransTy = CGM.getTargetCodeGenInfo().getOpenCLType(
++          CGM, CGM.getContext().OCLSamplerTy.getTypePtr()))
++    SamplerTy = TransTy;
++  else
++    SamplerTy = llvm::PointerType::get(
++        llvm::StructType::create(CGM.getLLVMContext(), "opencl.sampler_t"),
++        CGM.getContext().getTargetAddressSpace(
++            CGM.getContext().getOpenCLTypeAddrSpace(T)));
+   return SamplerTy;
+ }
+
+diff --git a/clang/lib/CodeGen/CGOpenCLRuntime.h b/clang/lib/CodeGen/CGOpenCLRuntime.h
+index 900644b3b93bd..c53641aea3fb8 100644
+--- a/clang/lib/CodeGen/CGOpenCLRuntime.h
++++ b/clang/lib/CodeGen/CGOpenCLRuntime.h
+@@ -38,7 +38,7 @@ class CGOpenCLRuntime {
+   CodeGenModule &CGM;
+   llvm::Type *PipeROTy;
+   llvm::Type *PipeWOTy;
+-  llvm::PointerType *SamplerTy;
++  llvm::Type *SamplerTy;
+   llvm::StringMap<llvm::PointerType *> CachedTys;
+
+   /// Structure for enqueued block information.
+@@ -70,7 +70,7 @@ class CGOpenCLRuntime {
+
+   virtual llvm::Type *getPipeType(const PipeType *T);
+
+-  llvm::PointerType *getSamplerType(const Type *T);
++  llvm::Type *getSamplerType(const Type *T);
+
+   // Returns a value which indicates the size in bytes of the pipe
+   // element.
+diff --git a/clang/lib/CodeGen/TargetInfo.cpp b/clang/lib/CodeGen/TargetInfo.cpp
+index 9e2d7a85d1007..a44ec40524a93 100644
+--- a/clang/lib/CodeGen/TargetInfo.cpp
++++ b/clang/lib/CodeGen/TargetInfo.cpp
+@@ -10557,6 +10557,7 @@ class CommonSPIRTargetCodeGenInfo : public TargetCodeGenInfo {
+   }
+
+   unsigned getOpenCLKernelCallingConv() const override;
++  llvm::Type *getOpenCLType(CodeGenModule &CGM, const Type *T) const override;
+ };
+ class SPIRVTargetCodeGenInfo : public CommonSPIRTargetCodeGenInfo {
+ public:
+@@ -10971,6 +10972,80 @@ static bool getTypeString(SmallStringEnc &Enc, const Decl *D,
+   return false;
+ }
+
++/// Construct a SPIR-V target extension type for the given OpenCL image type.
++static llvm::Type *getSPIRVImageType(llvm::LLVMContext &Ctx, StringRef BaseType,
++                                     StringRef OpenCLName,
++                                     unsigned AccessQualifier) {
++  // These parameters compare to the operands of OpTypeImage (see
++  // https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#OpTypeImage
++  // for more details). The first 6 integer parameters all default to 0, and
++  // will be changed to 1 only for the image type(s) that set the parameter to
++  // one. The 7th integer parameter is the access qualifier, which is tacked on
++  // at the end.
++  SmallVector<unsigned, 7> IntParams = {0, 0, 0, 0, 0, 0};
++
++  // Choose the dimension of the image--this corresponds to the Dim enum in
++  // SPIR-V (first integer parameter of OpTypeImage).
++  if (OpenCLName.startswith("image2d"))
++    IntParams[0] = 1; // 1D
++  else if (OpenCLName.startswith("image3d"))
++    IntParams[0] = 2; // 2D
++  else if (OpenCLName == "image1d_buffer")
++    IntParams[0] = 5; // Buffer
++  else
++    assert(OpenCLName.startswith("image1d") && "Unknown image type");
++
++  // Set the other integer parameters of OpTypeImage if necessary. Note that the
++  // OpenCL image types don't provide any information for the Sampled or
++  // Image Format parameters.
++  if (OpenCLName.contains("_depth"))
++    IntParams[1] = 1;
++  if (OpenCLName.contains("_array"))
++    IntParams[2] = 1;
++  if (OpenCLName.contains("_msaa"))
++    IntParams[3] = 1;
++
++  // Access qualifier
++  IntParams.push_back(AccessQualifier);
++
++  return llvm::TargetExtType::get(Ctx, BaseType, {llvm::Type::getVoidTy(Ctx)},
++                                  IntParams);
++}
++
++llvm::Type *CommonSPIRTargetCodeGenInfo::getOpenCLType(CodeGenModule &CGM,
++                                                       const Type *Ty) const {
++  llvm::LLVMContext &Ctx = CGM.getLLVMContext();
++  if (auto *PipeTy = dyn_cast<PipeType>(Ty))
++    return llvm::TargetExtType::get(Ctx, "spirv.Pipe", {},
++                                    {!PipeTy->isReadOnly()});
++  if (auto *BuiltinTy = dyn_cast<BuiltinType>(Ty)) {
++    enum AccessQualifier : unsigned { AQ_ro = 0, AQ_wo = 1, AQ_rw = 2 };
++    switch (BuiltinTy->getKind()) {
++#define IMAGE_TYPE(ImgType, Id, SingletonId, Access, Suffix)                   \
++    case BuiltinType::Id:                                                      \
++      return getSPIRVImageType(Ctx, "spirv.Image", #ImgType, AQ_##Suffix);
++#include "clang/Basic/OpenCLImageTypes.def"
++    case BuiltinType::OCLSampler:
++      return llvm::TargetExtType::get(Ctx, "spirv.Sampler");
++    case BuiltinType::OCLEvent:
++      return llvm::TargetExtType::get(Ctx, "spirv.Event");
++    case BuiltinType::OCLClkEvent:
++      return llvm::TargetExtType::get(Ctx, "spirv.DeviceEvent");
++    case BuiltinType::OCLQueue:
++      return llvm::TargetExtType::get(Ctx, "spirv.Queue");
++    case BuiltinType::OCLReserveID:
++      return llvm::TargetExtType::get(Ctx, "spirv.ReserveId");
++#define INTEL_SUBGROUP_AVC_TYPE(Name, Id)                                      \
++    case BuiltinType::OCLIntelSubgroupAVC##Id:                                 \
++      return llvm::TargetExtType::get(Ctx, "spirv.Avc" #Id "INTEL");
++#include "clang/Basic/OpenCLExtensionTypes.def"
++    default:
++      return nullptr;
++    }
++  }
++
++  return nullptr;
++}
+ //===----------------------------------------------------------------------===//
+ // RISCV ABI Implementation
+ //===----------------------------------------------------------------------===//
+diff --git a/clang/lib/CodeGen/TargetInfo.h b/clang/lib/CodeGen/TargetInfo.h
+index c7c1ec7fce7e3..d93c017ebb382 100644
+--- a/clang/lib/CodeGen/TargetInfo.h
++++ b/clang/lib/CodeGen/TargetInfo.h
+@@ -376,6 +376,11 @@ class TargetCodeGenInfo {
+     // DO NOTHING by default.
+     return false;
+   }
++
++  /// Return an LLVM type that corresponds to an OpenCL type.
++  virtual llvm::Type *getOpenCLType(CodeGenModule &CGM, const Type *T) const {
++    return nullptr;
++  }
+ };
+
+ } // namespace CodeGen
+diff --git a/clang/test/CodeGenOpenCL/cast_image.cl b/clang/test/CodeGenOpenCL/cast_image.cl
+index af68a7e720742..51f46fa7712ed 100644
+--- a/clang/test/CodeGenOpenCL/cast_image.cl
++++ b/clang/test/CodeGenOpenCL/cast_image.cl
+@@ -1,5 +1,5 @@
+ // RUN: %clang_cc1 -no-opaque-pointers -emit-llvm -o - -triple amdgcn--amdhsa %s | FileCheck --check-prefix=AMDGCN %s
+-// RUN: %clang_cc1 -no-opaque-pointers -emit-llvm -o - -triple spir-unknown-unknown %s | FileCheck --check-prefix=SPIR %s
++// RUN: %clang_cc1 -no-opaque-pointers -emit-llvm -o - -triple x86_64-unknown-unknown %s | FileCheck --check-prefix=X86 %s
+
+ #ifdef __AMDGCN__
+
+@@ -11,7 +11,7 @@ constant int* convert(image2d_t img) {
+ #else
+
+ global int* convert(image2d_t img) {
+-  // SPIR: bitcast %opencl.image2d_ro_t addrspace(1)* %img to i32 addrspace(1)*
++  // X86: bitcast %opencl.image2d_ro_t* %img to i32*
+   return __builtin_astype(img, global int*);
+ }
+
+diff --git a/clang/test/CodeGenOpenCL/intel-subgroups-avc-ext-types.cl b/clang/test/CodeGenOpenCL/intel-subgroups-avc-ext-types.cl
+index 3c55276213e62..49e1eaf91fdd2 100644
+--- a/clang/test/CodeGenOpenCL/intel-subgroups-avc-ext-types.cl
++++ b/clang/test/CodeGenOpenCL/intel-subgroups-avc-ext-types.cl
+@@ -1,45 +1,30 @@
+-// RUN: %clang_cc1 -no-opaque-pointers %s -triple spir-unknown-unknown -cl-std=CL1.2 -cl-ext=+cl_intel_device_side_avc_motion_estimation -emit-llvm -o - -O0 | FileCheck %s
++// RUN: %clang_cc1 %s -triple spir-unknown-unknown -cl-std=CL1.2 -cl-ext=+cl_intel_device_side_avc_motion_estimation -emit-llvm -o - -O0 | FileCheck %s
+
+-// CHECK: %opencl.intel_sub_group_avc_mce_payload_t = type opaque
+-// CHECK: %opencl.intel_sub_group_avc_ime_payload_t = type opaque
+-// CHECK: %opencl.intel_sub_group_avc_ref_payload_t = type opaque
+-// CHECK: %opencl.intel_sub_group_avc_sic_payload_t = type opaque
++// CHECK: store target("spirv.AvcImePayloadINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcRefPayloadINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcSicPayloadINTEL") zeroinitializer,
+
+-// CHECK: %opencl.intel_sub_group_avc_mce_result_t = type opaque
+-// CHECK: %opencl.intel_sub_group_avc_ime_result_t = type opaque
+-// CHECK: %opencl.intel_sub_group_avc_ref_result_t = type opaque
+-// CHECK: %opencl.intel_sub_group_avc_sic_result_t = type opaque
++// CHECK: store target("spirv.AvcImeResultINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcRefResultINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcSicResultINTEL") zeroinitializer,
+
+-// CHECK: %opencl.intel_sub_group_avc_ime_result_single_reference_streamout_t = type opaque
+-// CHECK: %opencl.intel_sub_group_avc_ime_result_dual_reference_streamout_t = type opaque
+-// CHECK: %opencl.intel_sub_group_avc_ime_single_reference_streamin_t = type opaque
+-// CHECK: %opencl.intel_sub_group_avc_ime_dual_reference_streamin_t = type opaque
++// CHECK: store target("spirv.AvcImeResultSingleReferenceStreamoutINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcImeResultDualReferenceStreamoutINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcImeSingleReferenceStreaminINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcImeDualReferenceStreaminINTEL") zeroinitializer,
+
+-// CHECK: store %opencl.intel_sub_group_avc_ime_payload_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_ref_payload_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_sic_payload_t* null,
++// CHECK: store target("spirv.AvcImePayloadINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcRefPayloadINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcSicPayloadINTEL") zeroinitializer,
+
+-// CHECK: store %opencl.intel_sub_group_avc_ime_result_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_ref_result_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_sic_result_t* null,
++// CHECK: store target("spirv.AvcImeResultINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcRefResultINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcSicResultINTEL") zeroinitializer,
+
+-// CHECK: store %opencl.intel_sub_group_avc_ime_result_single_reference_streamout_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_ime_result_dual_reference_streamout_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_ime_single_reference_streamin_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_ime_dual_reference_streamin_t* null,
+-//
+-// CHECK: store %opencl.intel_sub_group_avc_ime_payload_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_ref_payload_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_sic_payload_t* null,
+-
+-// CHECK: store %opencl.intel_sub_group_avc_ime_result_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_ref_result_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_sic_result_t* null,
+-
+-// CHECK: store %opencl.intel_sub_group_avc_ime_result_single_reference_streamout_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_ime_result_dual_reference_streamout_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_ime_single_reference_streamin_t* null,
+-// CHECK: store %opencl.intel_sub_group_avc_ime_dual_reference_streamin_t* null,
++// CHECK: store target("spirv.AvcImeResultSingleReferenceStreamoutINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcImeResultDualReferenceStreamoutINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcImeSingleReferenceStreaminINTEL") zeroinitializer,
++// CHECK: store target("spirv.AvcImeDualReferenceStreaminINTEL") zeroinitializer,
+
+ #pragma OPENCL EXTENSION cl_intel_device_side_avc_motion_estimation : enable
+
+diff --git a/clang/test/CodeGenOpenCL/opencl_types.cl b/clang/test/CodeGenOpenCL/opencl_types.cl
+index 17e70a9f774fb..b8ccfa26f16d9 100644
+--- a/clang/test/CodeGenOpenCL/opencl_types.cl
++++ b/clang/test/CodeGenOpenCL/opencl_types.cl
+@@ -10,65 +10,65 @@ constant sampler_t glb_smp = CLK_ADDRESS_CLAMP_TO_EDGE|CLK_NORMALIZED_COORDS_TRU
+ // CHECK-COM-NOT: constant i32
+
+ void fnc1(image1d_t img) {}
+-// CHECK-SPIR: @fnc1(ptr addrspace(1)
++// CHECK-SPIR: @fnc1(target("spirv.Image", void, 0, 0, 0, 0, 0, 0, 0)
+ // CHECK-AMDGCN: @fnc1(ptr addrspace(4)
+
+ void fnc1arr(image1d_array_t img) {}
+-// CHECK-SPIR: @fnc1arr(ptr addrspace(1)
++// CHECK-SPIR: @fnc1arr(target("spirv.Image", void, 0, 0, 1, 0, 0, 0, 0)
+ // CHECK-AMDGCN: @fnc1arr(ptr addrspace(4)
+
+ void fnc1buff(image1d_buffer_t img) {}
+-// CHECK-SPIR: @fnc1buff(ptr addrspace(1)
++// CHECK-SPIR: @fnc1buff(target("spirv.Image", void, 5, 0, 0, 0, 0, 0, 0)
+ // CHECK-AMDGCN: @fnc1buff(ptr addrspace(4)
+
+ void fnc2(image2d_t img) {}
+-// CHECK-SPIR: @fnc2(ptr addrspace(1)
++// CHECK-SPIR: @fnc2(target("spirv.Image", void, 1, 0, 0, 0, 0, 0, 0)
+ // CHECK-AMDGCN: @fnc2(ptr addrspace(4)
+
+ void fnc2arr(image2d_array_t img) {}
+-// CHECK-SPIR: @fnc2arr(ptr addrspace(1)
++// CHECK-SPIR: @fnc2arr(target("spirv.Image", void, 1, 0, 1, 0, 0, 0, 0)
+ // CHECK-AMDGCN: @fnc2arr(ptr addrspace(4)
+
+ void fnc3(image3d_t img) {}
+-// CHECK-SPIR: @fnc3(ptr addrspace(1)
++// CHECK-SPIR: @fnc3(target("spirv.Image", void, 2, 0, 0, 0, 0, 0, 0)
+ // CHECK-AMDGCN: @fnc3(ptr addrspace(4)
+
+ void fnc4smp(sampler_t s) {}
+-// CHECK-SPIR-LABEL: define {{.*}}void @fnc4smp(ptr addrspace(2)
++// CHECK-SPIR-LABEL: define {{.*}}void @fnc4smp(target("spirv.Sampler")
+ // CHECK-AMDGCN-LABEL: define {{.*}}void @fnc4smp(ptr addrspace(4)
+
+ kernel void foo(image1d_t img) {
+   sampler_t smp = CLK_ADDRESS_CLAMP_TO_EDGE|CLK_NORMALIZED_COORDS_TRUE|CLK_FILTER_LINEAR;
+-  // CHECK-SPIR: alloca ptr addrspace(2)
++  // CHECK-SPIR: alloca target("spirv.Sampler")
+   // CHECK-AMDGCN: alloca ptr addrspace(4)
+   event_t evt;
+-  // CHECK-SPIR: alloca ptr
++  // CHECK-SPIR: alloca target("spirv.Event")
+   // CHECK-AMDGCN: alloca ptr addrspace(5)
+   clk_event_t clk_evt;
+-  // CHECK-SPIR: alloca ptr
++  // CHECK-SPIR: alloca target("spirv.DeviceEvent")
+   // CHECK-AMDGCN: alloca ptr addrspace(1)
+   queue_t queue;
+-  // CHECK-SPIR: alloca ptr
++  // CHECK-SPIR: alloca target("spirv.Queue")
+   // CHECK-AMDGCN: alloca ptr addrspace(1)
+   reserve_id_t rid;
+-  // CHECK-SPIR: alloca ptr
++  // CHECK-SPIR: alloca target("spirv.ReserveId")
+   // CHECK-AMDGCN: alloca ptr addrspace(1)
+-  // CHECK-SPIR: store ptr addrspace(2)
++  // CHECK-SPIR: store target("spirv.Sampler")
+   // CHECK-AMDGCN: store ptr addrspace(4)
+   fnc4smp(smp);
+-  // CHECK-SPIR: call {{.*}}void @fnc4smp(ptr addrspace(2)
++  // CHECK-SPIR: call {{.*}}void @fnc4smp(target("spirv.Sampler")
+   // CHECK-AMDGCN: call {{.*}}void @fnc4smp(ptr addrspace(4)
+   fnc4smp(glb_smp);
+-  // CHECK-SPIR: call {{.*}}void @fnc4smp(ptr addrspace(2)
++  // CHECK-SPIR: call {{.*}}void @fnc4smp(target("spirv.Sampler")
+   // CHECK-AMDGCN: call {{.*}}void @fnc4smp(ptr addrspace(4)
+ }
+
+ kernel void foo_ro_pipe(read_only pipe int p) {}
+-// CHECK-SPIR: @foo_ro_pipe(ptr addrspace(1) %p)
++// CHECK-SPIR: @foo_ro_pipe(target("spirv.Pipe", 0) %p)
+ // CHECK_AMDGCN: @foo_ro_pipe(ptr addrspace(1) %p)
+
+ kernel void foo_wo_pipe(write_only pipe int p) {}
+-// CHECK-SPIR: @foo_wo_pipe(ptr addrspace(1) %p)
++// CHECK-SPIR: @foo_wo_pipe(target("spirv.Pipe", 1) %p)
+ // CHECK_AMDGCN: @foo_wo_pipe(ptr addrspace(1) %p)
+
+ void __attribute__((overloadable)) bad1(image1d_t b, image2d_t c, image2d_t d) {}
+diff --git a/clang/test/CodeGenOpenCL/sampler.cl b/clang/test/CodeGenOpenCL/sampler.cl
+index 6c367a2327e37..3649afba50fe2 100644
+--- a/clang/test/CodeGenOpenCL/sampler.cl
++++ b/clang/test/CodeGenOpenCL/sampler.cl
+@@ -1,6 +1,9 @@
+-// RUN: %clang_cc1 -no-opaque-pointers %s -emit-llvm -triple spir-unknown-unknown -o - -O0 | FileCheck %s
+-// RUN: %clang_cc1 -no-opaque-pointers %s -cl-std=CL2.0 -emit-llvm -triple spir-unknown-unknown -o - -O0 | FileCheck %s
+-// RUN: %clang_cc1 -no-opaque-pointers %s -cl-std=clc++ -emit-llvm -triple spir-unknown-unknown -o - -O0 | FileCheck %s
++// RUN: %clang_cc1 %s -emit-llvm -triple spir-unknown-unknown -o - -O0 | FileCheck --check-prefixes=CHECK-COMMON,CHECK-SPIR %s
++// RUN: %clang_cc1 %s -cl-std=CL2.0 -emit-llvm -triple spir-unknown-unknown -o - -O0 | FileCheck --check-prefixes=CHECK-COMMON,CHECK-SPIR %s
++// RUN: %clang_cc1 %s -cl-std=clc++ -emit-llvm -triple spir-unknown-unknown -o - -O0 | FileCheck --check-prefixes=CHECK-COMMON,CHECK-SPIR %s
++// RUN: %clang_cc1 %s -emit-llvm -triple x86_64-unknown-linux-gnu -o - -O0 | FileCheck --check-prefixes=CHECK-COMMON,CHECK-X86 %s
++// RUN: %clang_cc1 %s -cl-std=CL2.0 -emit-llvm -triple x86_64-unknown-linux-gnu -o - -O0 | FileCheck --check-prefixes=CHECK-COMMON,CHECK-X86 %s
++// RUN: %clang_cc1 %s -cl-std=clc++ -emit-llvm -triple x86_64-unknown-linux-gnu -o - -O0 | FileCheck --check-prefixes=CHECK-COMMON,CHECK-X86 %s
+ //
+ // This test covers 5 cases of sampler initialzation:
+ //   1. function argument passing
+@@ -17,74 +20,98 @@
+ #define CLK_FILTER_NEAREST              0x10
+ #define CLK_FILTER_LINEAR               0x20
+
+-// CHECK: %opencl.sampler_t = type opaque
+-
+ // Case 2a
+ constant sampler_t glb_smp = CLK_ADDRESS_CLAMP_TO_EDGE | CLK_NORMALIZED_COORDS_TRUE | CLK_FILTER_LINEAR;
+-// CHECK-NOT: glb_smp
++// CHECK-COMMON-NOT: glb_smp
+
+ // Case 2c
+ const sampler_t glb_smp_const = CLK_ADDRESS_CLAMP_TO_EDGE | CLK_NORMALIZED_COORDS_TRUE | CLK_FILTER_LINEAR;
+-// CHECK-NOT: glb_smp_const
++// CHECK-COMMON-NOT: glb_smp_const
+
+ int get_sampler_initializer(void);
+
+ void fnc4smp(sampler_t s) {}
+-// CHECK: define{{.*}} spir_func void [[FUNCNAME:@.*fnc4smp.*]](%opencl.sampler_t addrspace(2)* %
++// CHECK-SPIR: define{{.*}} spir_func void [[FUNCNAME:@.*fnc4smp.*]](target("spirv.Sampler") %
++// CHECK-X86: define{{.*}} void [[FUNCNAME:@.*fnc4smp.*]](ptr %
+
+ kernel void foo(sampler_t smp_par) {
+-  // CHECK-LABEL: define{{.*}} spir_kernel void @foo(%opencl.sampler_t addrspace(2)* %smp_par)
+-  // CHECK: [[smp_par_ptr:%[A-Za-z0-9_\.]+]] = alloca %opencl.sampler_t addrspace(2)*
++  // CHECK-SPIR-LABEL: define{{.*}} spir_kernel void @foo(target("spirv.Sampler") %smp_par)
++  // CHECK-SPIR: [[smp_par_ptr:%[A-Za-z0-9_\.]+]] = alloca target("spirv.Sampler")
++  // CHECK-X86-LABEL: define{{.*}} spir_kernel void @foo(ptr %smp_par)
++  // CHECK-X86: [[smp_par_ptr:%[A-Za-z0-9_\.]+]] = alloca ptr
+
+   // Case 2b
+   sampler_t smp = CLK_ADDRESS_CLAMP_TO_EDGE | CLK_NORMALIZED_COORDS_TRUE | CLK_FILTER_NEAREST;
+-  // CHECK: [[smp_ptr:%[A-Za-z0-9_\.]+]] = alloca %opencl.sampler_t addrspace(2)*
+-  // CHECK: [[SAMP:%[0-9]+]] = call spir_func %opencl.sampler_t addrspace(2)* @__translate_sampler_initializer(i32 19)
+-  // CHECK: store %opencl.sampler_t addrspace(2)* [[SAMP]], %opencl.sampler_t addrspace(2)** [[smp_ptr]]
++  // CHECK-SPIR: [[smp_ptr:%[A-Za-z0-9_\.]+]] = alloca target("spirv.Sampler")
++  // CHECK-SPIR: [[SAMP:%[0-9]+]] = call spir_func target("spirv.Sampler") @__translate_sampler_initializer(i32 19)
++  // CHECK-SPIR: store target("spirv.Sampler") [[SAMP]], ptr [[smp_ptr]]
++  // CHECK-X86: [[smp_ptr:%[A-Za-z0-9_\.]+]] = alloca ptr
++  // CHECK-X86: [[SAMP:%[0-9]+]] = call ptr @__translate_sampler_initializer(i32 19)
++  // CHECK-X86: store ptr [[SAMP]], ptr [[smp_ptr]]
+
+   // Case 1b
+   fnc4smp(smp);
+-  // CHECK-NOT: call %opencl.sampler_t addrspace(2)* @__translate_sampler_initializer(i32 19)
+-  // CHECK: [[SAMP:%[0-9]+]] = load %opencl.sampler_t addrspace(2)*, %opencl.sampler_t addrspace(2)** [[smp_ptr]]
+-  // CHECK: call spir_func void [[FUNCNAME]](%opencl.sampler_t addrspace(2)* [[SAMP]])
++  // CHECK-SPIR-NOT: call target("spirv.Sampler") @__translate_sampler_initializer(i32 19)
++  // CHECK-SPIR: [[SAMP:%[0-9]+]] = load target("spirv.Sampler"), ptr [[smp_ptr]]
++  // CHECK-SPIR: call spir_func void [[FUNCNAME]](target("spirv.Sampler") [[SAMP]])
++  // CHECK-X86-NOT: call ptr @__translate_sampler_initializer(i32 19)
++  // CHECK-X86: [[SAMP:%[0-9]+]] = load ptr, ptr [[smp_ptr]]
++  // CHECK-X86: call void [[FUNCNAME]](ptr [[SAMP]])
+
+   // Case 1b
+   fnc4smp(smp);
+-  // CHECK-NOT: call %opencl.sampler_t addrspace(2)* @__translate_sampler_initializer(i32 19)
+-  // CHECK: [[SAMP:%[0-9]+]] = load %opencl.sampler_t addrspace(2)*, %opencl.sampler_t addrspace(2)** [[smp_ptr]]
+-  // CHECK: call spir_func void [[FUNCNAME]](%opencl.sampler_t addrspace(2)* [[SAMP]])
++  // CHECK-SPIR-NOT: call target("spirv.Sampler") @__translate_sampler_initializer(i32 19)
++  // CHECK-SPIR: [[SAMP:%[0-9]+]] = load target("spirv.Sampler"), ptr [[smp_ptr]]
++  // CHECK-SPIR: call spir_func void [[FUNCNAME]](target("spirv.Sampler") [[SAMP]])
++  // CHECK-X86-NOT: call ptr @__translate_sampler_initializer(i32 19)
++  // CHECK-X86: [[SAMP:%[0-9]+]] = load ptr, ptr [[smp_ptr]]
++  // CHECK-X86: call void [[FUNCNAME]](ptr [[SAMP]])
+
+   // Case 1a/2a
+   fnc4smp(glb_smp);
+-  // CHECK: [[SAMP:%[0-9]+]] = call spir_func %opencl.sampler_t addrspace(2)* @__translate_sampler_initializer(i32 35)
+-  // CHECK: call spir_func void [[FUNCNAME]](%opencl.sampler_t addrspace(2)* [[SAMP]])
++  // CHECK-SPIR: [[SAMP:%[0-9]+]] = call spir_func target("spirv.Sampler") @__translate_sampler_initializer(i32 35)
++  // CHECK-SPIR: call spir_func void [[FUNCNAME]](target("spirv.Sampler") [[SAMP]])
++  // CHECK-X86: [[SAMP:%[0-9]+]] = call ptr @__translate_sampler_initializer(i32 35)
++  // CHECK-X86: call void [[FUNCNAME]](ptr [[SAMP]])
+
+   // Case 1a/2c
+   fnc4smp(glb_smp_const);
+-  // CHECK: [[SAMP:%[0-9]+]] = call spir_func %opencl.sampler_t addrspace(2)* @__translate_sampler_initializer(i32 35)
+-  // CHECK: call spir_func void [[FUNCNAME]](%opencl.sampler_t addrspace(2)* [[SAMP]])
++  // CHECK-SPIR: [[SAMP:%[0-9]+]] = call spir_func target("spirv.Sampler") @__translate_sampler_initializer(i32 35)
++  // CHECK-SPIR: call spir_func void [[FUNCNAME]](target("spirv.Sampler") [[SAMP]])
++  // CHECK-X86: [[SAMP:%[0-9]+]] = call ptr @__translate_sampler_initializer(i32 35)
++  // CHECK-X86: call void [[FUNCNAME]](ptr [[SAMP]])
+
+   // Case 1c
+   fnc4smp(smp_par);
+-  // CHECK: [[SAMP:%[0-9]+]] = load %opencl.sampler_t addrspace(2)*, %opencl.sampler_t addrspace(2)** [[smp_par_ptr]]
+-  // CHECK: call spir_func void [[FUNCNAME]](%opencl.sampler_t addrspace(2)* [[SAMP]])
++  // CHECK-SPIR: [[SAMP:%[0-9]+]] = load target("spirv.Sampler"), ptr [[smp_par_ptr]]
++  // CHECK-SPIR: call spir_func void [[FUNCNAME]](target("spirv.Sampler") [[SAMP]])
++  // CHECK-X86: [[SAMP:%[0-9]+]] = load ptr, ptr [[smp_par_ptr]]
++  // CHECK-X86: call void [[FUNCNAME]](ptr [[SAMP]])
+
+   fnc4smp(5);
+-  // CHECK: [[SAMP:%[0-9]+]] = call spir_func %opencl.sampler_t addrspace(2)* @__translate_sampler_initializer(i32 5)
+-  // CHECK: call spir_func void [[FUNCNAME]](%opencl.sampler_t addrspace(2)* [[SAMP]])
++  // CHECK-SPIR: [[SAMP:%[0-9]+]] = call spir_func target("spirv.Sampler") @__translate_sampler_initializer(i32 5)
++  // CHECK-SPIR: call spir_func void [[FUNCNAME]](target("spirv.Sampler") [[SAMP]])
++  // CHECK-X86: [[SAMP:%[0-9]+]] = call ptr @__translate_sampler_initializer(i32 5)
++  // CHECK-X86: call void [[FUNCNAME]](ptr [[SAMP]])
+
+   const sampler_t const_smp = CLK_ADDRESS_CLAMP_TO_EDGE | CLK_NORMALIZED_COORDS_TRUE | CLK_FILTER_LINEAR;
+   fnc4smp(const_smp);
+-   // CHECK: [[CONST_SAMP:%[0-9]+]] = call spir_func %opencl.sampler_t addrspace(2)* @__translate_sampler_initializer(i32 35)
+-  // CHECK: store %opencl.sampler_t addrspace(2)* [[CONST_SAMP]], %opencl.sampler_t addrspace(2)** [[CONST_SMP_PTR:%[a-zA-Z0-9]+]]
++  // CHECK-SPIR: [[CONST_SAMP:%[0-9]+]] = call spir_func target("spirv.Sampler") @__translate_sampler_initializer(i32 35)
++  // CHECK-SPIR: store target("spirv.Sampler") [[CONST_SAMP]], ptr [[CONST_SMP_PTR:%[a-zA-Z0-9]+]]
++  // CHECK-X86: [[CONST_SAMP:%[0-9]+]] = call ptr @__translate_sampler_initializer(i32 35)
++  // CHECK-X86: store ptr [[CONST_SAMP]], ptr [[CONST_SMP_PTR:%[a-zA-Z0-9]+]]
+   fnc4smp(const_smp);
+-  // CHECK: [[SAMP:%[0-9]+]] = load %opencl.sampler_t addrspace(2)*, %opencl.sampler_t addrspace(2)** [[CONST_SMP_PTR]]
+-  // CHECK: call spir_func void [[FUNCNAME]](%opencl.sampler_t addrspace(2)* [[SAMP]])
++  // CHECK-SPIR: [[SAMP:%[0-9]+]] = load target("spirv.Sampler"), ptr [[CONST_SMP_PTR]]
++  // CHECK-SPIR: call spir_func void [[FUNCNAME]](target("spirv.Sampler") [[SAMP]])
++  // CHECK-X86: [[SAMP:%[0-9]+]] = load ptr, ptr [[CONST_SMP_PTR]]
++  // CHECK-X86: call void [[FUNCNAME]](ptr [[SAMP]])
+
+   constant sampler_t constant_smp = CLK_ADDRESS_CLAMP_TO_EDGE | CLK_NORMALIZED_COORDS_TRUE | CLK_FILTER_LINEAR;
+   fnc4smp(constant_smp);
+-  // CHECK: [[SAMP:%[0-9]+]] = call spir_func %opencl.sampler_t addrspace(2)* @__translate_sampler_initializer(i32 35)
+-  // CHECK: call spir_func void [[FUNCNAME]](%opencl.sampler_t addrspace(2)* [[SAMP]])
++  // CHECK-SPIR: [[SAMP:%[0-9]+]] = call spir_func target("spirv.Sampler") @__translate_sampler_initializer(i32 35)
++  // CHECK-SPIR: call spir_func void [[FUNCNAME]](target("spirv.Sampler") [[SAMP]])
++  // CHECK-X86: [[SAMP:%[0-9]+]] = call ptr @__translate_sampler_initializer(i32 35)
++  // CHECK-X86: call void [[FUNCNAME]](ptr [[SAMP]])
+
+   // TODO: enable sampler initialization with non-constant integer.
+   //const sampler_t const_smp_func_init = get_sampler_initializer();
+diff --git a/llvm/docs/SPIRVUsage.rst b/llvm/docs/SPIRVUsage.rst
+index 0f75e001e661e..5ca035b68392f 100644
+--- a/llvm/docs/SPIRVUsage.rst
++++ b/llvm/docs/SPIRVUsage.rst
+@@ -75,3 +75,36 @@ to specify the target triple:
+ Example:
+
+ ``-target spirv64v1.0`` can be used to compile for SPIR-V version 1.0 with 64-bit pointer width.
++
++.. _spirv-types:
++
++Representing special types in SPIR-V
++====================================
++
++SPIR-V specifies several kinds of opaque types. These types are represented
++using target extension types. These types are represented as follows:
++
++  .. table:: SPIR-V Opaque Types
++
++     ================== ====================== =========================================================================================
++     SPIR-V Type        LLVM type name         LLVM type arguments
++     ================== ====================== =========================================================================================
++     OpTypeImage        ``spirv.Image``        sampled type, dimensionality, depth, arrayed, MS, sampled, image format, access qualifier
++     OpTypeSampler      ``spirv.Sampler``      (none)
++     OpTypeSampledImage ``spirv.SampledImage`` sampled type, dimensionality, depth, arrayed, MS, sampled, image format, access qualifier
++     OpTypeEvent        ``spirv.Event``        (none)
++     OpTypeDeviceEvent  ``spirv.DeviceEvent``  (none)
++     OpTypeReserveId    ``spirv.ReserveId``    (none)
++     OpTypeQueue        ``spirv.Queue``        (none)
++     OpTypePipe         ``spirv.Pipe``         access qualifier
++     OpTypePipeStorage  ``spirv.PipeStorage``  (none)
++     ================== ====================== =========================================================================================
++
++All integer arguments take the same value as they do in their `corresponding
++SPIR-V instruction <https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#_type_declaration_instructions>`_.
++For example, the OpenCL type ``image2d_depth_ro_t`` would be represented in
++SPIR-V IR as ``target("spirv.Image", void, 1, 1, 0, 0, 0, 0, 0)``, with its
++dimensionality parameter as ``1`` meaning 2D. Sampled image types include the
++parameters of its underlying image type, so that a sampled image for the
++previous type has the representation
++``target("spirv.SampledImage, void, 1, 1, 0, 0, 0, 0, 0)``.
